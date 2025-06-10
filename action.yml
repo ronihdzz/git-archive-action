@@ -1,48 +1,94 @@
-name: 'Test with Artifacts'
-description: 'Builds the Docker image and runs tests, then saves artifacts'
+name: "Git Archive Action"
+description: "Guarda los reportes de cobertura en la rama de artefactos"
+
 inputs:
   gh-token:
-    description: 'GitHub Token'
+    description: "GitHub Token para poder pushear a la rama de artefactos"
     required: true
   artifacts-branch:
-    description: 'Name of the branch to save artifacts'
+    description: "Nombre de la rama donde se subirán los artefactos (reportes de cobertura, etc.)"
     required: false
-    default: 'artifacts'
-  dockerfile-path:
-    description: 'Path to the Dockerfile for testing'
-    required: true
-    default: 'deployments/tests/Dockerfile.test'
+    default: "artifacts"
+  coverage-source:
+    description: "Ruta relativa al workspace donde se encuentran los reportes, o si is-artifact es true, nombre (o ruta) del archivo ZIP"
+    required: false
+    default: "coverage-reports"
+  is-artifact:
+    description: "Si es true, indica que el reporte viene de un artifact y se debe descargar; en caso contrario se copiará la carpeta directamente"
+    required: false
+    default: "false"
+
 runs:
-  using: 'composite'
+  using: "composite"
   steps:
-    - name: Checkout code
+    # ----------------------------------------------------------------------------------------
+    # Paso 1: Hacer checkout del código en la carpeta "action-repo"
+    # ----------------------------------------------------------------------------------------
+    - name: "Checkout code"
       uses: actions/checkout@v3
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
-
-    - name: Cache Docker layers
-      uses: actions/cache@v3
       with:
-        path: /tmp/.buildx-cache
-        key: ${{ runner.os }}-buildx-${{ github.sha }}
-        restore-keys: |
-          ${{ runner.os }}-buildx-
+        path: "action-repo"
 
-    - name: Build and run tests
+    # ----------------------------------------------------------------------------------------
+    # Paso 2A (si is-artifact es true): Descargar el artifact de cobertura
+    # ----------------------------------------------------------------------------------------
+    - name: "Descargar artifact de cobertura"
+      if: ${{ inputs.is-artifact == 'true' }}
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.coverage-source }}
+        path: downloaded-coverage
+
+    # ----------------------------------------------------------------------------------------
+    # Paso 2B: Verificar el contenido de la cobertura
+    #     - Si is-artifact es true se revisa "downloaded-coverage".
+    #     - Si is-artifact es false se revisa el folder "coverage-source" directamente.
+    # ----------------------------------------------------------------------------------------
+    - name: "Verificar artifact descargado de cobertura"
+      if: ${{ inputs.is-artifact == 'true' }}
       shell: bash
       env:
-        DOCKERFILE_PATH: ${{ inputs.dockerfile-path }}
+        WORKSPACE_PATH: ${{ github.workspace }}
       run: |
-        echo "Building Docker image using Dockerfile at $DOCKERFILE_PATH"
-        docker build -f $DOCKERFILE_PATH -t tests-project .
-        echo "Running tests in Docker container"
-        docker run --rm \
-          -v ${{ github.workspace }}/deployments/tests/reports:/application/src/reports \
-          tests-project
-        echo "Tests completed. Reports are available in deployments/tests/reports"
+        set -e
+        echo "▶️ Verificando artifact descargado..."
+        cd "${WORKSPACE_PATH}/downloaded-coverage"
+        if [ ! "$(ls -A .)" ]; then
+          echo "❌ Error: La carpeta 'downloaded-coverage' está vacía."
+          exit 1
+        fi
+        echo "✅ Artifact descargado y contiene archivos. Listando contenido:"
+        ls -lahR .
+        echo "REPORTS_PATH=${WORKSPACE_PATH}/downloaded-coverage" >> "$GITHUB_ENV"
 
-    - name: Save artifacts to branch
+    - name: "Verificar carpeta de cobertura"
+      if: ${{ inputs.is-artifact != 'true' }}
+      shell: bash
+      env:
+        WORKSPACE_PATH: ${{ github.workspace }}
+        REPORTS_PATH: ${{ inputs.coverage-source }}
+      run: |
+        set -e
+        echo "▶️ Verificando la carpeta de cobertura..."
+        cd "${WORKSPACE_PATH}"
+        echo "🔍 Revisando la carpeta '${REPORTS_PATH}' en '${WORKSPACE_PATH}'"
+        if [ ! -d "${REPORTS_PATH}" ]; then
+          echo "❌ Error: La carpeta '${WORKSPACE_PATH}/${REPORTS_PATH}' no existe."
+          exit 1
+        fi
+        FILE_COUNT=$(find "${REPORTS_PATH}" | wc -l)
+        if [ "${FILE_COUNT}" -le 1 ]; then
+          echo "❌ Error: La carpeta '${WORKSPACE_PATH}/${REPORTS_PATH}' está vacía."
+          exit 1
+        fi
+        echo "✅ La carpeta '${REPORTS_PATH}' existe y contiene archivos. Listando contenido:"
+        ls -lahR "${REPORTS_PATH}"
+        echo "REPORTS_PATH=${WORKSPACE_PATH}/${REPORTS_PATH}" >> "$GITHUB_ENV"
+
+    # ----------------------------------------------------------------------------------------
+    # Paso 3: Clonar (o crear) la rama de artefactos en la carpeta "artifacts-repo"
+    # ----------------------------------------------------------------------------------------
+    - name: "Clonar o crear la rama de artefactos"
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.gh-token }}
@@ -50,46 +96,91 @@ runs:
         BRANCH_NAME: ${{ github.ref_name }}
         REPO_NAME: ${{ github.repository }}
         ARTIFACTS_BRANCH: ${{ inputs.artifacts-branch }}
+        WORKSPACE_PATH: ${{ github.workspace }}
       run: |
-        echo "Configuring git user"
+        set -e
+        echo "▶️ Iniciando clonación o creación de la rama '${ARTIFACTS_BRANCH}'"
+        # Configurar Git
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
         git config --global user.name "github-actions[bot]"
-
-        echo "Checking if artifacts branch exists"
-        BRANCH_EXISTS=$(git ls-remote --heads https://${GH_TOKEN}@github.com/${REPO_NAME}.git ${ARTIFACTS_BRANCH})
-        if [ -n "$BRANCH_EXISTS" ]; then
-          echo "Branch ${ARTIFACTS_BRANCH} exists. Cloning the branch"
-          git clone --branch ${ARTIFACTS_BRANCH} --single-branch https://${GH_TOKEN}@github.com/${REPO_NAME}.git artifacts-repo
-          cd artifacts-repo
+        git config --global init.defaultBranch "${ARTIFACTS_BRANCH}"
+        
+        echo "🔎 Verificando si la rama '${ARTIFACTS_BRANCH}' ya existe en remoto"
+        BRANCH_EXISTS=$(git ls-remote --heads "https://x-access-token:${GH_TOKEN}@github.com/${REPO_NAME}.git" "${ARTIFACTS_BRANCH}")
+        
+        if [ -n "${BRANCH_EXISTS}" ]; then
+          echo "✅ La rama '${ARTIFACTS_BRANCH}' existe. Clonándola en la carpeta 'artifacts-repo'."
+          git clone --branch "${ARTIFACTS_BRANCH}" --single-branch "https://x-access-token:${GH_TOKEN}@github.com/${REPO_NAME}.git" "artifacts-repo"
         else
-          echo "Branch ${ARTIFACTS_BRANCH} does not exist. Creating new orphan branch"
-          mkdir artifacts-repo
-          cd artifacts-repo
+          echo "🆕 La rama '${ARTIFACTS_BRANCH}' NO existe. Creándola como rama huérfana."
+          mkdir -p "artifacts-repo"
+          cd "artifacts-repo"
           git init
-          git checkout --orphan ${ARTIFACTS_BRANCH}
-          git commit --allow-empty -m "Initial commit for ${ARTIFACTS_BRANCH} branch"
-          git remote add origin https://${GH_TOKEN}@github.com/${REPO_NAME}.git
-          git push --set-upstream origin ${ARTIFACTS_BRANCH}
+          git checkout --orphan "${ARTIFACTS_BRANCH}"
+          git commit --allow-empty -m "Commit inicial para la rama ${ARTIFACTS_BRANCH}"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO_NAME}.git"
+          git push --set-upstream origin "${ARTIFACTS_BRANCH}"
+          cd ..
+        fi
+        echo "📁 Directorio final: $(pwd). Si existe 'artifacts-repo', se clonó o se inicializó."
+
+    # ----------------------------------------------------------------------------------------
+    # Paso 4: Copiar los reportes de cobertura desde la carpeta REPORTS_PATH (descargada o local)
+    #         a 'artifacts-repo' y hacer commit de los artefactos.
+    # ----------------------------------------------------------------------------------------
+    - name: "Copiar cobertura y hacer commit"
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-token }}
+        COMMIT_ID: ${{ github.sha }}
+        BRANCH_NAME: ${{ github.ref_name }}
+        REPO_NAME: ${{ github.repository }}
+        ARTIFACTS_BRANCH: ${{ inputs.artifacts-branch }}
+        WORKSPACE_PATH: ${{ github.workspace }}
+      run: |
+        set -e
+        # Verificar que la variable REPORTS_PATH esté definida (desde pasos anteriores)
+        if [ -z "${REPORTS_PATH}" ]; then
+          echo "❌ Error: La variable REPORTS_PATH no está definida."
+          exit 1
+        fi
+        echo "Usando REPORTS_PATH=${REPORTS_PATH}"
+
+        # Ubicarnos en la carpeta clonada de la rama de artefactos
+        if [ -d "artifacts-repo" ]; then
+          cd "artifacts-repo"
+        else
+          echo "⚠️ No se encontró 'artifacts-repo'. Revisar si hubo error previo en la clonación."
+          exit 1
         fi
 
-        echo "Creating directories for artifacts"
-        mkdir -p ${BRANCH_NAME}/${COMMIT_ID}
-        cp ../deployments/tests/reports/* ${BRANCH_NAME}/${COMMIT_ID}/
-        mkdir -p ${BRANCH_NAME}/latest
-        cp ../deployments/tests/reports/* ${BRANCH_NAME}/latest/
+        echo "▶️ Creando directorios para guardar la cobertura en 'artifacts-repo'."
+        mkdir -p "${BRANCH_NAME}/${COMMIT_ID}"
+        mkdir -p "${BRANCH_NAME}/latest"
 
-        echo "Adding README to artifacts repository"
-        README_CONTENT="# Artifacts Repository\n\nThis repository contains test reports and other artifacts for the project."
-        echo -e $README_CONTENT > README.md
+        echo "🔀 Regresando a '${WORKSPACE_PATH}' para copiar la cobertura."
+        cd "${WORKSPACE_PATH}"
 
-        echo "Adding artifacts and README to git"
-        git add README.md
-        git add ${BRANCH_NAME}/${COMMIT_ID}/*
-        git add ${BRANCH_NAME}/latest/*
+        echo "📂 Copiando contenido de '${REPORTS_PATH}' a 'artifacts-repo/${BRANCH_NAME}/${COMMIT_ID}'"
+        cp -r "${REPORTS_PATH}/." "${WORKSPACE_PATH}/artifacts-repo/${BRANCH_NAME}/${COMMIT_ID}/"
+        cp -r "${REPORTS_PATH}/." "${WORKSPACE_PATH}/artifacts-repo/${BRANCH_NAME}/latest/"
 
-        git commit -m "Add artifacts and README for commit $COMMIT_ID on branch $BRANCH_NAME"
-        
-        echo "Pushing artifacts to ${ARTIFACTS_BRANCH} branch"
-        git push origin ${ARTIFACTS_BRANCH}
-        
-        echo "Artifacts have been successfully pushed to ${ARTIFACTS_BRANCH} branch"
+        echo "✅ Cobertura copiada. Preparando commit..."
+        cd "${WORKSPACE_PATH}/artifacts-repo"
+
+        echo "📝 Creando (o editando) README.md"
+        echo "# Repositorio de Artefactos" > README.md
+        echo "" >> README.md
+        echo "Contiene reportes de test y otros artefactos del proyecto." >> README.md
+
+        echo "📦 Agregando todos los cambios al staging."
+        git add .
+
+        COMMIT_MESSAGE="Agregar artefactos y README para commit ${COMMIT_ID} en la rama ${BRANCH_NAME}"
+        echo "📦 Haciendo commit con mensaje: '${COMMIT_MESSAGE}'"
+        git commit -m "${COMMIT_MESSAGE}" || echo "⚠️ No hay cambios nuevos que comitear."
+
+        echo "🚀 Haciendo push a la rama '${ARTIFACTS_BRANCH}'"
+        git push origin "${ARTIFACTS_BRANCH}"
+
+        echo "✅ Artefactos subidos exitosamente a la rama '${ARTIFACTS_BRANCH}'."
