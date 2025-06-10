@@ -267,3 +267,110 @@ jobs:
       - `coverage-source: 'coverage-artifact'`: Here's the magic! The value we pass is the same name we gave the artifact in the previous job (`name: coverage-artifact`). Our Action will know it needs to search for and download an artifact with that name.
       - `is-artifact: 'true'`: We explicitly tell the Action that `coverage-source` is the name of an artifact to download, rather than a local folder.
       - `artifacts-branch: 'coverage-history'`: This is an example of how you can override the default branch name (`artifacts`) to use a custom one.
+
+## 🎯 7. Showcase: Example Project in Action
+
+To demonstrate how this Action integrates into a complex and realistic CI/CD workflow, you can explore the following example repository:
+
+**Example Repository:** [ronihdzz/git-archive-action-testing-example](https://github.com/ronihdzz/git-archive-action-testing-example)
+
+This project showcases a complete use case where integration tests are run against multiple services (PostgreSQL, MongoDB, Redis), coverage reports are generated within a Docker container, and finally this Action is used to persist those reports.
+
+### Example Project Workflow
+
+Below is the workflow code used in the example project:
+
+```yaml
+name: Run Tests
+
+on:
+  push:
+    branches: [main,development]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      COVERAGE_REPORTS: coverage-reports
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd="pg_isready" --health-interval=10s --health-timeout=5s --health-retries=5
+      mongodb:
+        image: mongo:4.4
+        ports: ['27017:27017']
+        options: >-
+          --health-cmd="mongo --eval 'db.runCommand({ ping: 1 })'" --health-interval=10s --health-timeout=5s --health-retries=5
+      redis:
+        image: redis:6
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd="redis-cli ping" --health-interval=10s --health-timeout=5s --health-retries=5
+    steps:
+      - name: 🧾 Checkout code
+        uses: actions/checkout@v3
+
+      - name: 🏗️ Build test image
+        run: docker build --progress=plain -t my-test-image -f docker_images/testing/Dockerfile.testing .
+
+      - name: 🚀 Run tests in container
+        run: |
+          docker run \
+            --name my-tests \
+            --network=host \
+            -e CI=true \
+            -e GITHUB_DATABASE_POSTGRESQL=postgres://test:test@localhost:5432/test_db \
+            -e GITHUB_DATABASE_MONGODB=mongodb://localhost:27017 \
+            -e GITHUB_DATABASE_REDIS=redis://localhost:6379 \
+            -v ${{ github.workspace }}/artifacts:/app/artifacts \
+            my-test-image
+
+      - name: 📥 Copy reports from container
+        run: |
+          mkdir -p ${{ env.COVERAGE_REPORTS }}
+          docker cp my-tests:/app/coverage-reports/. ${{ env.COVERAGE_REPORTS }}
+          echo "📄 Files copied from container:"
+          ls -lh ${{ env.COVERAGE_REPORTS }}
+          
+      - name: 📤 Upload coverage as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.COVERAGE_REPORTS }}
+          path: ${{ env.COVERAGE_REPORTS }}
+
+      - name: Save coverage
+        uses: ronihdzz/git-archive-action@v3
+        with:
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts-branch: 'artifacts'
+          coverage-source: ${{ env.COVERAGE_REPORTS }}
+          is-artifact: false
+```
+
+### Detailed Real-World Flow Explanation
+
+1. **services**: The workflow defines three services (PostgreSQL, MongoDB, and Redis) that start alongside the job. Thanks to health-checks, the test steps won't begin until these databases are ready to accept connections, simulating a production environment.
+
+2. **Build test image**: A Docker image specific to testing is built. This encapsulates all project dependencies and ensures a consistent testing environment.
+
+3. **Run tests in container**: The test container is executed with:
+   - `--network=host`: Allows the container to communicate with database services running on the runner through localhost.
+   - `-e ...`: Database connection strings are injected as environment variables.
+
+4. **Copy reports from container**: This is a critical step. Once tests finish inside the container, the generated reports exist only within that container's filesystem. The `docker cp` command is used to extract those reports from the container (`my-tests:/app/coverage-reports/.`) to the runner's filesystem (`${{ env.COVERAGE_REPORTS }}`), making them accessible to subsequent steps.
+
+5. **Upload coverage as artifact**: This step uses the official `upload-artifact` action to upload reports to the "Artifacts" section of the workflow in GitHub's UI. This is useful for quick review and manual downloads.
+
+6. **Save coverage**: Finally, our Action is called:
+   - `uses: ronihdzz/git-archive-action@v3`: Executes the Action to persist the reports.
+   - `coverage-source: ${{ env.COVERAGE_REPORTS }}`: Indicates the path to the folder containing the reports. It's the same folder created in the "Copy reports..." step.
+   - `is-artifact: false`: It's very important to note that `false` is used. Although the previous step uploaded an artifact, our Action in this case is working with the local folder that was extracted from the container with `docker cp`. This demonstrates the Action's flexibility to work directly with files on the runner.
